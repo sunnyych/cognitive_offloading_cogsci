@@ -1,0 +1,1576 @@
+---
+title: "cognitive_offloading_analysis_cogsci"
+author: "sunny yu"
+date: "2026-01-014"
+output: html_document
+---
+# load dependencies 
+```{r setup, include=FALSE}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(emmeans)
+library(psych)
+```
+
+# read datasets: prediction_sample is the data collected from the prediction sample; completion_sample1 is data collected for the completion sample
+
+```{r}
+prediction_sample <- read_csv("/data/prediction_sample.csv")
+completion_sample1 <- read_csv("/data/completion_sample1.csv")
+```
+
+
+
+### PRE-PROCESSING: clean data (prediction_sample and completion_sample for analysis)
+## Pre-processing prediction sample: prediction_df
+# We will include the following columns: ParticipantID, group (another participant or AI), taskID (6-character-long string, CATEGORY_QUESTION_GRADIENT), diffulcty (G1: easy, G2: difficult), prediction_target (independent vs. assisted), predicted_time
+```{r}
+
+
+prediction_sample <- prediction_sample %>%
+  mutate(
+    group = if_else(Condition == '1', "AI", "another_participant")
+  )
+
+task_map <- tibble::tibble(
+  task_index = 1:4,
+  task_col   = c("C1", "C2", "C3", "C4")
+)
+
+long_df <- map_dfr(seq_len(nrow(task_map)), function(i) {
+  task_col <- task_map$task_col[[i]]
+  k <- task_map$task_index[[i]]
+
+  # Column names for this task index (k)
+  ind_other_col <- paste0("task", k, "_independent_1")
+  help_other_col <- paste0("task", k, "_help_1")
+
+  ind_ai_col <- paste0("task", k, "_independent_AI_1")
+  help_ai_col <- paste0("task", k, "_help_AI_1")
+
+  prediction_sample %>%
+    transmute(
+      participantID = id,
+      group = group,
+
+      # 24-level taskID: e.g., "C1Q1G1"
+      taskID = paste0(task_col, .data[[task_col]]),
+      difficulty = str_sub(as.character(.data[[task_col]]), -2, -1),
+      frequency = frequency,
+      AIAS_1 = AIAS_1,
+      AIAS_2 = AIAS_2,
+      AIAS_3 = AIAS_3,
+      AIAS_4 = AIAS_4,
+
+      # choose the right numeric columns based on group
+      predicted_independent = if_else(
+        group == "AI",
+        parse_number(as.character(.data[[ind_ai_col]])),
+        parse_number(as.character(.data[[ind_other_col]]))
+      ),
+      predicted_assisted = if_else(
+        group == "AI",
+        parse_number(as.character(.data[[help_ai_col]])),
+        parse_number(as.character(.data[[help_other_col]]))
+      )
+    ) %>%
+    pivot_longer(
+      cols = c(predicted_independent, predicted_assisted),
+      names_to = "prediction_target",
+      values_to = "predicted_time"
+    ) %>%
+    mutate(
+      prediction_target = recode(
+        prediction_target,
+        predicted_independent = "independent",
+        predicted_assisted    = "assisted"
+      )
+    )
+})
+
+prediction_df <- long_df %>%
+  filter(!is.na(predicted_time)) %>%
+  mutate(
+    participantID = factor(participantID),
+    taskID = factor(taskID),
+    group = factor(group, levels = c("another_participant", "AI")),
+    prediction_target = factor(prediction_target,
+                               levels = c("independent", "assisted")),
+    
+  )
+
+```
+
+
+## pre-processing completion sample
+# completion_df: We will include the following columns: participantID, condition (independnet vs. AI), need_for_cognition (average of NFC), taskID, difficulty, time, copypaste (1: copied and pasted, 0: not copied and pasted), NASA_TLX1-5/average
+```{r}
+# process data to include the following columns: condition (independent vs. AI), difficulty (G1 vs. G2), pid, taskID, completion time
+
+task_map <- tibble::tibble(
+  task_index = 1:4,
+  task_col   = c("C1", "C2", "C3", "C4"),
+  ind_time_col = c("task1_timer_Page Submit", "task2_timer_Page Submit",
+                   "task3_timer_Page Submit", "task4_timer_Page Submit"),
+  ai_time_col  = c("task1_timer_Page Submit.1", "task2_timer_Page Submit.1",
+                   "task3_timer_Page Submit.1", "task4_timer_Page Submit.1")
+)
+
+# helper: safe numeric conversion (handles numeric, character, "NaN", etc.)
+to_num <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    x <- str_trim(x)
+    x <- dplyr::na_if(x, "")
+    x <- dplyr::na_if(x, "NaN")
+    x <- dplyr::na_if(x, "NA")
+    x <- dplyr::na_if(x, "N/A")
+    return(readr::parse_number(x, na = c("", "NA", "NaN", "N/A")))
+  }
+  suppressWarnings(as.numeric(x))
+}
+
+# reverse code 1–7 (for TLX item 3 in your code)
+rev7 <- function(x) ifelse(is.na(x), NA_real_, 8 - x)
+
+# reverse code 1–5 (for NFC items 3 and 4)
+rev5 <- function(x) ifelse(is.na(x), NA_real_, 6 - x)
+
+completion_sample_nfc <- completion_sample1 %>%
+  mutate(
+    nfc1 = to_num(need_for_cognition_1),
+    nfc2 = to_num(need_for_cognition_2),
+    nfc3 = rev5(to_num(need_for_cognition_3)),  # reverse-coded
+    nfc4 = rev5(to_num(need_for_cognition_4)),  # reverse-coded
+    nfc5 = to_num(need_for_cognition_5),
+    nfc6 = to_num(need_for_cognition_6),
+    need_for_cognition = rowMeans(cbind(nfc1, nfc2, nfc3, nfc4, nfc5, nfc6), na.rm = TRUE)
+  ) %>%
+  select(-nfc1, -nfc2, -nfc3, -nfc4, -nfc5, -nfc6)
+
+processed_df <- purrr::map_dfr(seq_len(nrow(task_map)), function(i) {
+  task_col <- task_map$task_col[[i]]
+  ind_col  <- task_map$ind_time_col[[i]]
+  ai_col   <- task_map$ai_time_col[[i]]
+  task_idx <- task_map$task_index[[i]]  # 1..4
+
+  # build TLX column names for THIS TASK (task-first, item-second)
+  tlx_ind_cols <- paste0("NASA-TLX", task_idx, "_", 1:5)
+  tlx_ai_cols  <- paste0(tlx_ind_cols, ".1")  # AI has ".1" suffix
+
+  copypaste_col <- paste0("prompt", task_idx, "_copypaste")
+
+  completion_sample_nfc %>%   # <--- use the NFC-enriched df
+    transmute(
+      participantID = id,
+
+      condition = dplyr::case_when(
+        as.character(Condition) == "0" ~ "independent",
+        as.character(Condition) == "1" ~ "AI",
+        TRUE ~ NA_character_
+      ),
+
+      # carry NFC into long df
+      need_for_cognition = need_for_cognition,
+      task1_correctness = task1_correctness,
+      task2_correctness = task2_correctness,
+      task3_correctness = task3_correctness,
+      task4_correctness = task4_correctness,
+      final_answer1_correctness = final_answer1_correctness,
+      final_answer2_correctness = final_answer2_correctness,
+      final_answer3_correctness = final_answer3_correctness,
+      final_answer4_correctness = final_answer4_correctness,
+      frequency = frequency,
+      AIAS_1 = AIAS_1,
+      AIAS_2 = AIAS_2,
+      AIAS_3 = AIAS_3,
+      AIAS_4 = AIAS_4,
+
+      # e.g., "C1Q1G1"
+      taskID = paste0(task_col, .data[[task_col]]),
+
+      # last 2 chars of the Ck value, e.g. "G1" / "G2"
+      difficulty = str_sub(as.character(.data[[task_col]]), -2, -1),
+
+      # completion time depends on Condition
+      time = if_else(
+        as.character(Condition) == "1",
+        to_num(.data[[ai_col]]),
+        to_num(.data[[ind_col]])
+      ),
+
+      copypaste = to_num(.data[[copypaste_col]]),
+
+      # TLX items 1..5 for THIS TASK, chosen by Condition
+      `NASA_TLX1` = if_else(
+        as.character(Condition) == "1",
+        to_num(.data[[tlx_ai_cols[1]]]),
+        to_num(.data[[tlx_ind_cols[1]]])
+      ),
+      `NASA_TLX2` = if_else(
+        as.character(Condition) == "1",
+        to_num(.data[[tlx_ai_cols[2]]]),
+        to_num(.data[[tlx_ind_cols[2]]])
+      ),
+      `NASA_TLX3` = rev7(if_else(   # reverse code item 3
+        as.character(Condition) == "1",
+        to_num(.data[[tlx_ai_cols[3]]]),
+        to_num(.data[[tlx_ind_cols[3]]])
+      )),
+      `NASA_TLX4` = if_else(
+        as.character(Condition) == "1",
+        to_num(.data[[tlx_ai_cols[4]]]),
+        to_num(.data[[tlx_ind_cols[4]]])
+      ),
+      `NASA_TLX5` = if_else(
+        as.character(Condition) == "1",
+        to_num(.data[[tlx_ai_cols[5]]]),
+        to_num(.data[[tlx_ind_cols[5]]])
+      ),
+
+      NASA_TLX_average = rowMeans(
+        cbind(`NASA_TLX1`, `NASA_TLX2`, `NASA_TLX3`, `NASA_TLX4`, `NASA_TLX5`),
+        na.rm = TRUE
+      )
+    )
+})
+
+completion_df <- processed_df %>%
+  filter(!is.na(time), !is.na(taskID), !is.na(condition), !is.na(difficulty)) %>%
+  mutate(
+    participantID = factor(participantID),
+    taskID = factor(taskID),
+
+    # create task_category BEFORE filtering
+    task_category = substr(as.character(taskID), 1, 2),
+
+    condition = factor(condition, levels = c("independent", "AI")),
+    difficulty = factor(difficulty, levels = c("G1", "G2"))
+  ) %>%
+  filter(
+    dplyr::case_when(
+      condition == "independent" & task_category == "C1" ~ task1_correctness == 1,
+      condition == "independent" & task_category == "C2" ~ task2_correctness == 1,
+      condition == "independent" & task_category == "C3" ~ task3_correctness == 1,
+      condition == "independent" & task_category == "C4" ~ task4_correctness == 1,
+
+      condition == "AI" & task_category == "C1" ~ final_answer1_correctness == 1,
+      condition == "AI" & task_category == "C2" ~ final_answer2_correctness == 1,
+      condition == "AI" & task_category == "C3" ~ final_answer3_correctness == 1,
+      condition == "AI" & task_category == "C4" ~ final_answer4_correctness == 1,
+
+      TRUE ~ FALSE
+    )
+  )
+
+```
+
+
+## concatendate prediction and completion into combined_df
+# added column: type (prediction vs. completion)
+
+```{r}
+# remove another participant from prediction_df (since we're only interested in data for AI vs. independent)
+
+prediction_df_filtered <- prediction_df %>%
+  filter(group != "another_participant") %>%   # keep AI group only
+  mutate(
+    condition = recode(prediction_target,
+                       assisted = "AI",
+                       independent = "independent"),
+    difficulty = str_sub(as.character(taskID), -2, -1)
+  ) %>%
+  select(-prediction_target)
+
+# Prepare prediction_sample
+prediction_sample_prepped <- prediction_df_filtered %>%
+  rename(time = predicted_time) %>%
+  mutate(type = "prediction")
+
+# Prepare completion_sample
+completion_sample_prepped <- completion_df %>%
+  mutate(type = "completion")
+
+# Concatenate
+combined_df <- bind_rows(
+  prediction_sample_prepped,
+  completion_sample_prepped,
+) %>%
+ mutate(
+    task_category = substr(taskID, 1, 2),
+    task_category = factor(task_category)
+ )
+```
+
+
+#____________________________________________
+
+### Analysis 
+## Hypothesis 1: predicted time for other > self 
+# model
+```{r}
+
+m1 <- lmer(
+  predicted_time ~ prediction_target * group +
+    (1 + prediction_target | participantID) +
+    (1 | taskID),
+  data = prediction_df
+)
+summary(m1)
+
+
+
+```
+# independent vs. assisted for AI
+```{r}
+# set group to AI to examine simple effects at prediction_target
+emm_ai <- emmeans(m1, ~ prediction_target, at = list(group = "AI"))
+contrast(emm_ai, method = "pairwise")
+
+```
+# independent vs. assisted for another participant
+```{r}
+emm_another_participant <- emmeans(m1, ~ prediction_target, at = list(group = "another_participant"))
+contrast(emm_another_participant, method = "pairwise")
+```
+
+```{r}
+# contrast between the two
+emm <- emmeans(m1, ~ prediction_target * group)
+
+contrast(
+  emm,
+  interaction = "pairwise",
+  by = NULL
+)
+```
+
+# category variations
+
+```{r}
+
+prediction_df <- prediction_df %>%
+  mutate(
+    task_category = substr(taskID, 1, 2),
+    task_category = factor(task_category)
+  )
+
+
+m_cat_int <- lmer(
+  predicted_time ~ prediction_target * group +
+    prediction_target * task_category +
+    (1 + prediction_target | participantID) +
+    (1 | taskID),
+  data = prediction_df
+)
+
+```
+
+```{r}
+# category variation for the AI condition
+emm_ai_cat <- emmeans(m_cat_int, ~ prediction_target | task_category, at = list(group = "AI"))
+contrast(emm_ai_cat, method = "pairwise")
+
+```
+
+```{r}
+# category variation for the "another participant" condition
+emm_another_participant <- emmeans(m_cat_int, ~ prediction_target | task_category, at = list(group = "another_participant"))
+contrast(emm_another_participant, method = "pairwise")
+```
+
+
+# difficulty variation
+```{r}
+
+m_difficulty_int <- lmer(
+  predicted_time ~ prediction_target * group +
+    prediction_target * difficulty +
+    (1 + prediction_target | participantID) +
+    (1 | taskID),
+  data = prediction_df
+)
+
+```
+
+
+# difficulty variation for AI
+```{r}
+emm_ai_diff <- emmeans(m_difficulty_int, ~ prediction_target | difficulty, at = list(group = "AI"))
+contrast(emm_ai_diff, method = "pairwise")
+```
+
+
+#difficulty variation for another participant
+```{r}
+emm_another_participant_diff <- emmeans(m_difficulty_int, ~ prediction_target | difficulty, at = list(group = "another_participant"))
+contrast(emm_another_participant_diff, method = "pairwise")
+
+```
+
+
+```{r}
+# task-level differences
+
+m_task <- lmer(
+  predicted_time ~ prediction_target * group * taskID +
+    (1 | participantID),
+  data = prediction_df
+)
+
+
+emm_ind <- emmeans(m_task, ~ prediction_target | taskID,
+                   at = list(group = "AI"))
+
+contrast(emm_ind, "pairwise", adjust = "holm")
+
+
+emm_ap <- emmeans(m_task, ~ prediction_target | taskID,
+                  at = list(group = "another_participant"))
+
+contrast(emm_ap, "pairwise", adjust = "holm")
+
+
+
+```
+
+
+## INDEPENDENT vs. AI
+```{r}
+# model: 
+
+m <- lmer(
+  time ~ condition  + difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = completion_df
+)
+summary(m)
+
+
+
+```
+
+
+
+```{r}
+m <- lmer(
+  time ~ condition*difficulty +
+    (1 | participantID) +
+   (1 | taskID),
+  data = completion_df
+)
+summary(m)
+
+emm <- emmeans(m, ~ condition | difficulty)
+
+contrast(emm, "pairwise", adjust = "holm")
+```
+# predicting nasa-tlx with nfc as a variable
+```{r}
+m <- lmer(
+  NASA_TLX_average ~ condition*need_for_cognition  + difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = completion_df
+)
+summary(m)
+```
+
+
+
+
+```{r}
+m <- lmer(
+  time ~ condition*taskID*difficulty +
+    (1 | participantID),
+  data = completion_df
+)
+summary(m)
+
+emm <- emmeans(m, ~ condition | taskID)
+
+contrast(emm, "pairwise", adjust = "holm")
+```
+
+
+## CALIBRATION ANALYSIS: predicted vs. actual for independet and for AI
+
+```{r}
+
+# model: 
+
+m_calibration <- lmer(
+  time ~ condition * type  + difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = combined_df
+)
+summary(m_calibration)
+
+
+```
+
+
+
+```{r}
+# simple effect of type for the independent condition (actual vs. predicted )
+emm_indep <- emmeans(
+  m_calibration,
+  ~ type ,
+  at = list(condition = "independent")
+)
+
+contrast(emm_indep, method = "pairwise", adjust = "holm")
+```
+
+
+
+
+
+```{r}
+# simple effect of type for the AI condition (actual vs. predicted )
+emm_AI <- emmeans(
+  m_calibration,
+  ~ type ,
+  at = list(condition = "AI")
+)
+
+contrast(emm_AI, method = "pairwise", adjust = "holm")
+```
+
+
+```{r}
+# task-category variations
+
+# model
+m_cat <- lmer(
+  time ~ condition * type  + 
+    type * task_category + 
+    difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = combined_df
+)
+
+emm_indep <- emmeans(
+  m_cat,
+  ~ type | task_category,
+  at = list(condition = "independent")
+)
+
+contrast(emm_indep, method = "pairwise", adjust = "holm")
+
+
+emm_AI <- emmeans(
+  m_cat,
+  ~ type | task_category,
+  at = list(condition = "AI")
+)
+
+contrast(emm_AI, method = "pairwise", adjust = "holm")
+
+
+```
+# difficulty variation
+```{r}
+# difficulty variations
+m_diff <- lmer(
+  time ~ condition * type +
+    type* difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = combined_df
+)
+
+emm_indep <- emmeans(
+  m_diff,
+  ~ type | difficulty,
+  at = list(condition = "independent")
+)
+
+contrast(emm_indep, method = "pairwise", adjust = "holm")
+
+
+emm_AI <- emmeans(
+  m_diff,
+  ~ type | difficulty,
+  at = list(condition = "AI")
+)
+
+contrast(emm_AI, method = "pairwise", adjust = "holm")
+```
+
+```{r}
+# task-level variations
+
+m_task <- lmer(
+  time ~ condition * type * taskID +
+    (1 | participantID),
+  data = combined_df
+)
+
+
+emm_ind <- emmeans(m_task, ~ type | taskID,
+                   at = list(condition = "independent"))
+
+contrast(emm_ind, "pairwise", adjust = "holm")
+
+
+emm_ai <- emmeans(m_task, ~ type | taskID,
+                  at = list(condition = "AI"))
+
+contrast(emm_ai, "pairwise", adjust = "holm")
+
+
+```
+
+## interaction effect between offloading and difficulty levels 
+```{r}
+# filter back to just the completion data
+completion_df <- combined_df %>%
+  dplyr::filter(type == "completion")
+
+m_interaction <- lmer(
+  time ~ condition * difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = completion_df,
+)
+summary(m_interaction)
+
+```
+
+## NASA-TLX: for the models above, change dv from time to NASA-TLX
+
+```{r}
+# correlation between completion time and NASA-TLX
+cols <- c("time", "NASA_TLX1", "NASA_TLX2", "NASA_TLX3", "NASA_TLX4", "NASA_TLX5", "NASA_TLX_average")
+completion_df %>% select(all_of(cols))
+completion_df <- completion_df %>%
+  mutate(across(all_of(cols), as.numeric))
+
+corr.test(completion_df %>% select(all_of(cols)),
+    method = "pearson", adjust = "holm")
+```
+# NASA-TLX overall
+```{r}
+# the most basic global model
+
+m_global <- lmer(
+  NASA_TLX_average ~ condition  + difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = completion_df,
+)
+summary(m_global)
+
+```
+
+# task category variation for NASA-TLX
+```{r}
+m_interaction_tc <- lmer(
+  NASA_TLX_average ~ condition * difficulty * task_category +
+         (1 | participantID) +
+         (1 | taskID),
+  data = completion_df
+)
+emm_tc <- emmeans(m_interaction_tc, ~ condition | task_category)
+contrast(emm_tc, method = "pairwise", adjust = "none")
+```
+
+# difficulty variation for NASA-TLX
+```{r}
+emm_diff <- emmeans(m_interaction_tc, ~ condition | difficulty)
+contrast(emm_diff, method = "pairwise", adjust = "none")
+```
+
+
+# per-task variation for NASA-TLX
+```{r}
+m_task <- lmer(
+  NASA_TLX_average ~ condition * taskID +
+         (1 | participantID),
+  data = completion_df
+)
+
+emm <- emmeans(m_task, ~ condition | taskID)
+contrast(emm, method = "pairwise", adjust = "none")
+
+```
+
+
+### EXPLORATORY ANALYSIS
+# pre-processing: stated_preference (1: prefer assistance (AI or another participant), 0: prefer independent completion)
+```{r}
+
+# ---- helpers for NFC ----
+to_num <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    x <- str_trim(x)
+    x <- dplyr::na_if(x, "")
+    x <- dplyr::na_if(x, "NaN")
+    x <- dplyr::na_if(x, "NA")
+    x <- dplyr::na_if(x, "N/A")
+    return(readr::parse_number(x, na = c("", "NA", "NaN", "N/A")))
+  }
+  suppressWarnings(as.numeric(x))
+}
+
+# reverse code (for a scale from 1–5)
+rev5 <- function(x) ifelse(is.na(x), NA_real_, 6 - x)
+
+prediction_sample <- prediction_sample %>%
+  mutate(
+    group = if_else(Condition == "1", "AI", "another_participant"),
+
+    # ---- NEW: need for cognition (row-wise) ----
+    nfc1 = to_num(need_for_cognition_1),
+    nfc2 = to_num(need_for_cognition_2),
+    nfc3 = rev5(to_num(need_for_cognition_3)),  # reverse-coded
+    nfc4 = rev5(to_num(need_for_cognition_4)),  # reverse-coded
+    nfc5 = to_num(need_for_cognition_5),
+    nfc6 = to_num(need_for_cognition_6),
+    need_for_cognition = rowMeans(cbind(nfc1, nfc2, nfc3, nfc4, nfc5, nfc6), na.rm = TRUE)
+  ) %>%
+  select(-nfc1, -nfc2, -nfc3, -nfc4, -nfc5, -nfc6)
+
+# Map tasks to their category column AND the correct "choice" columns
+task_map <- tibble::tibble(
+  task_index = 1:4,
+  task_col   = c("C1", "C2", "C3", "C4"),
+  choice_other_col = c("task1_choice", "task2_choice", "task3_choice", "task4_choice"),
+  choice_ai_col    = c("task1_choice_AI", "task2_choice_AI", "task3_choice_AI", "task4_choice_AI")
+)
+
+long_df <- map_dfr(seq_len(nrow(task_map)), function(i) {
+  task_col <- task_map$task_col[[i]]
+  k <- task_map$task_index[[i]]
+
+  choice_other_col <- task_map$choice_other_col[[i]]
+  choice_ai_col    <- task_map$choice_ai_col[[i]]
+
+  # Column names for predicted-time inputs
+  ind_other_col  <- paste0("task", k, "_independent_1")
+  help_other_col <- paste0("task", k, "_help_1")
+  ind_ai_col     <- paste0("task", k, "_independent_AI_1")
+  help_ai_col    <- paste0("task", k, "_help_AI_1")
+
+  prediction_sample %>%
+    transmute(
+      participantID = id,
+      group = group,
+
+      # ---- NEW: carry NFC through ----
+      need_for_cognition = need_for_cognition,
+      nfc1 = need_for_cognition_1,
+           nfc2 = need_for_cognition_2,
+           nfc3 = need_for_cognition_3,
+           nfc4 = need_for_cognition_4,
+           nfc5 = need_for_cognition_5,
+      frequency = frequency,
+      AIAS_1 = AIAS_1,
+        AIAS_2 = AIAS_2,
+        AIAS_3 = AIAS_3,
+        AIAS_4 = AIAS_4,
+      
+
+      # 24-level taskID: e.g., "C1Q1G1"
+      taskID = paste0(task_col, .data[[task_col]]),
+
+      # task difficulty from task code (your original behavior)
+      difficulty_level = str_sub(as.character(.data[[task_col]]), -2, -1),
+
+      # predicted times (choose the right numeric columns based on group)
+      predicted_independent = if_else(
+        group == "AI",
+        parse_number(as.character(.data[[ind_ai_col]])),
+        parse_number(as.character(.data[[ind_other_col]]))
+      ),
+      predicted_assisted = if_else(
+        group == "AI",
+        parse_number(as.character(.data[[help_ai_col]])),
+        parse_number(as.character(.data[[help_other_col]]))
+      ),
+
+      # stated preference: pick the right choice column based on group
+      stated_choice_raw = if_else(
+        group == "AI",
+        as.character(.data[[choice_ai_col]]),
+        as.character(.data[[choice_other_col]])
+      ),
+      stated_preference = case_when(
+        str_detect(stated_choice_raw, "^Independently") ~ 0L,
+        str_detect(stated_choice_raw, "^With") ~ 1L,
+        TRUE ~ NA_integer_
+      )
+    ) %>%
+    pivot_longer(
+      cols = c(predicted_independent, predicted_assisted),
+      names_to = "prediction_target",
+      values_to = "predicted_time"
+    ) %>%
+    mutate(
+      prediction_target = recode(
+        prediction_target,
+        predicted_independent = "independent",
+        predicted_assisted    = "assisted"
+      )
+    )
+})
+
+stated_preference_df <- long_df %>%
+  filter(!is.na(predicted_time)) %>%
+  mutate(
+    participantID = factor(participantID),
+    taskID = factor(taskID),
+    group = factor(group, levels = c("another_participant", "AI")),
+    prediction_target = factor(prediction_target, levels = c("independent", "assisted")),
+    difficulty_level = factor(difficulty_level),
+    stated_preference = as.integer(stated_preference),
+    frequency = frequency,
+      AIAS_1 = AIAS_1,
+      AIAS_2 = AIAS_2,
+    AIAS_3 = AIAS_3,
+      AIAS_4 = AIAS_4,
+  )
+
+# normalize NFC
+stated_preference_df <- stated_preference_df %>%
+  mutate(
+    need_for_cognition_c = scale(need_for_cognition, center = TRUE, scale = TRUE)
+  )
+
+```
+
+
+## stated preference
+
+# prediction target and predicted preference
+```{r}
+m_sp <- glmer(
+  stated_preference ~ group*difficulty_level +
+    (1 + prediction_target | participantID) +
+    (1 | taskID),
+  data = stated_preference_df,
+  family = binomial(link = "logit")
+)
+summary(m_sp)
+
+
+emm <- emmeans(
+  m_sp,
+  ~ difficulty_level,
+  type = "response"  # converts log-odds → probabilities
+)
+
+emm
+
+```
+
+
+
+## copying and pasting behaviors
+
+```{r}
+
+m_interaction <- lmer(
+  time ~ condition * copypaste + difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = completion_df,
+)
+summary(m_interaction)
+
+# how copying and pasting affects time
+
+emm <- emmeans(m_interaction, ~ copypaste,
+                  at = list(condition = "AI"))
+
+contrast(emm, "pairwise", adjust = "holm")
+```
+# how copypaste affects subjective effort
+```{r}
+m_cp_nasa <- lmer(
+  NASA_TLX_average ~ condition * copypaste + difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = completion_df,
+)
+
+emm_cp_nasa <- emmeans(m_cp_nasa, ~ copypaste,
+                  at = list(condition = "AI"))
+contrast(emm_cp_nasa, "pairwise", adjust = "holm")
+```
+
+## decomposing completion time (code used for pre-processing in Python)
+# df structure: time_type (processing_time vs. prompting_time); time; generation_time (this is minimal, can ignore)
+
+```{r}
+# load decomp_df (df with data about decomposition of each component)
+
+# helper
+to_num <- function(x) {
+  # Works for numeric, character, factors; converts "NaN"/"NA"/"" to NA
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    x <- dplyr::na_if(x, "")
+    x <- dplyr::na_if(x, "NaN")
+    x <- dplyr::na_if(x, "NA")
+    x <- dplyr::na_if(x, "N/A")
+  }
+  suppressWarnings(as.numeric(x))
+}
+
+# ---- task map ----
+task_map <- tibble(
+  task_index = 1:4,
+  task_category = c("C1", "C2", "C3", "C4"),
+  prompting_col   = paste0("task", 1:4, "_prompting_time"),
+  generation_col  = paste0("task", 1:4, "_model_generation_time"),
+  processing_col  = paste0("task", 1:4, "_processing_time")
+)
+
+processed_df <- map_dfr(seq_len(nrow(task_map)), function(i) {
+
+  tm <- task_map[i, ]
+
+  completion_sample_time_decomp %>%
+    filter(as.character(Condition) == '1') %>%
+    transmute(
+      participantID = id,
+      condition = "AI",
+
+      # task category (C1–C4)
+      task_category = tm$task_category,
+
+      # e.g., C1Q1G1
+      taskID = paste0(
+        tm$task_category,
+        .data[[tm$task_category]]
+      ),
+
+      # extract G1 / G2 from Ck column
+      difficulty = str_sub(
+        as.character(.data[[tm$task_category]]),
+        -2, -1
+      ),
+
+      prompting_time  = to_num(.data[[tm$prompting_col]]),
+      generation_time = to_num(.data[[tm$generation_col]]),
+      processing_time = to_num(.data[[tm$processing_col]])
+    )
+})
+
+decomp_df <- processed_df %>%
+  filter(
+    !is.na(prompting_time),
+    !is.na(generation_time),
+    !is.na(processing_time),
+    !is.na(taskID),
+    !is.na(difficulty)
+  ) %>%
+  mutate(
+    participantID = factor(participantID),
+    taskID = factor(taskID),
+    task_category = factor(task_category, levels = c("C1", "C2", "C3", "C4")),
+    difficulty = factor(difficulty, levels = c("G1", "G2")),
+    condition = factor(condition, levels = "AI")
+  )
+
+
+decomp_df <- decomp_df %>%
+  pivot_longer(
+    cols = c(prompting_time, processing_time),
+    names_to = "time_type",
+    values_to = "time"
+  ) %>%
+  mutate(
+    time_type = factor(
+      time_type,
+      levels = c("prompting_time", "processing_time")
+    )
+  )
+
+
+
+
+```
+
+
+# global difference
+```{r}
+m_global <- lmer(
+  time ~ time_type +
+    (1 | participantID) +
+    (1 | taskID),
+  data = decomp_df
+)
+summary(m_global)
+```
+
+
+```{r}
+m_diff <- lmer(
+  time ~ time_type * difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = decomp_df
+)
+
+emm <- emmeans(m_diff, ~ time_type | difficulty)
+contrast(emm, "pairwise")
+
+```
+# task category
+```{r}
+
+m_cat <- lmer(
+  time ~ time_type * task_category +
+    (1 | participantID) +
+    (1 | taskID),
+  data = decomp_df
+)
+
+
+emm_cat <- emmeans(m_cat, ~ time_type | task_category)
+contrast(emm_cat, "pairwise", adjust = "holm")
+
+
+```
+# for specific tasks
+
+```{r}
+m_cat <- lmer(
+  time ~ time_type * taskID +
+    (1 | participantID),
+  data = decomp_df
+)
+
+
+emm_cat <- emmeans(m_cat, ~ time_type | taskID)
+contrast(emm_cat, "pairwise", adjust = "holm")
+```
+
+
+
+## individual differences (Need for Cognition)
+```{r}
+# how need_for_cognition predicts copypaste
+completion_ai_df <- completion_df %>%
+  dplyr::filter(condition == "AI")
+
+m_interaction <- lmer(
+  copypaste ~  need_for_cognition + difficulty +
+    (1 | participantID) +
+    (1 | taskID),
+  data = completion_ai_df,
+)
+
+summary(m_interaction)
+
+```
+
+
+
+# individual traits analysis
+```{r}
+# NFC and predicted time: does participants lower in NFC (lazier) predict a greater effect of offloading 
+
+diff_df <- stated_preference_df %>%
+  select(participantID, taskID, group, difficulty_level,
+         prediction_target, predicted_time, nfc4) %>%
+  pivot_wider(
+    names_from = prediction_target,
+    values_from = predicted_time
+  ) %>%
+  mutate(
+    delta_predicted_time = assisted - independent,
+    nfc4 = scale(nfc4, TRUE, TRUE)
+  )
+
+m_nfc_diff <- lmer(
+  delta_predicted_time ~ nfc4 * group +
+    (1 | participantID) +
+    (1 | taskID),
+  data = diff_df
+)
+summary(m_nfc_diff)
+
+```
+
+
+
+
+```{r}
+
+
+library(stringr)
+
+diff_df <- stated_preference_df %>%
+  select(participantID, taskID, group, difficulty_level,
+         prediction_target, predicted_time, frequency,
+         AIAS_1, AIAS_2, AIAS_3, AIAS_4) %>%
+  pivot_wider(
+    names_from = prediction_target,
+    values_from = predicted_time
+  ) %>%
+  mutate(
+    delta_predicted_time = assisted - independent,
+    frequency = factor(frequency),
+    group = factor(group),
+    AIAS_1_num = as.numeric(str_extract(AIAS_1, "\\d+$")),
+    AIAS_2_num = as.numeric(str_extract(AIAS_2, "\\d+$")),
+    AIAS_3_num = as.numeric(str_extract(AIAS_3, "\\d+$")),
+    AIAS_4_num = as.numeric(str_extract(AIAS_4, "\\d+$"))
+  )
+
+m_nfc_diff_num <- lmer(
+  delta_predicted_time ~ AIAS_4_num * group +
+    (1 | participantID) +
+    (1 | taskID),
+  data = diff_df
+)
+
+summary(m_nfc_diff_num)
+```
+
+
+
+### PLOTTING CODE
+# Figure 2: predicted vs. actual for the 2 conditions 
+```{r}
+
+# Bar plot: condition (independent vs AI) × type (prediction vs completion)
+# with 95% CI bars (± 1.96 * SE) and significance brackets:
+# - within independent: prediction vs completion = n.s.
+# - within AI: prediction vs completion = significant
+
+
+library(dplyr)
+library(ggplot2)
+
+# --- clean factors / labels ---
+plot_df <- combined_df %>%
+  mutate(
+    condition = factor(condition, levels = c("independent", "AI")),
+    type = factor(type, levels = c("prediction", "completion"),
+                  labels = c("Predicted time", "Actual time"))
+  )
+
+# --- summarize for bars + CI (± 1.96 * SE) ---
+sum_df <- plot_df %>%
+  group_by(condition, type) %>%
+  summarize(
+    n = sum(!is.na(time)),
+    mean_time = mean(time, na.rm = TRUE),
+    se = sd(time, na.rm = TRUE) / sqrt(n),
+    ci = 1.96 * se,
+    .groups = "drop"
+  )
+
+# --- significance tests within each condition (prediction vs completion) ---
+# This is a simple default. If you have participantID/taskID, replace with a mixed model.
+p_ind <- t.test(time ~ type, data = filter(plot_df, condition == "independent"))$p.value
+p_ai  <- t.test(time ~ type, data = filter(plot_df, condition == "AI"))$p.value
+
+label_from_p <- function(p) {
+  if (is.na(p)) return("n/a")
+  if (p < 0.001) return("***")
+  if (p < 0.01)  return("**")
+  if (p < 0.05)  return("*")
+  return("n.s.")
+}
+
+sig_df <- sum_df %>%
+  group_by(condition) %>%
+  summarize(
+    y = max(mean_time + ci, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    y = y + 0.05 * max(sum_df$mean_time + sum_df$ci, na.rm = TRUE),  # small padding
+    label = c(label_from_p(p_ind), label_from_p(p_ai))
+  )
+
+# helper to get dodge positions for bracket endpoints
+dodge_w <- 0.8
+get_x <- function(cond, type_label) {
+  # ggplot uses discrete x positions 1,2,... for condition,
+  # and dodges by type within each x.
+  # With two levels of type, the dodged x offsets are approx ± dodge_w/4
+  base <- as.numeric(factor(cond, levels = levels(sum_df$condition)))
+  offset <- ifelse(type_label == "Predicted time", -dodge_w/4, dodge_w/4)
+  base + offset
+}
+
+sig_df <- sig_df %>%
+  rowwise() %>%
+  mutate(
+    x1 = get_x(condition, "Predicted time"),
+    x2 = get_x(condition, "Actual time"),
+    y1 = y,
+    y2 = y + 0.03 * max(sum_df$mean_time + sum_df$ci, na.rm = TRUE) # bracket height
+  ) %>%
+  ungroup()
+
+# --- plot ---
+pdf("figure2_cogsci.pdf", width = 8, height = 6)
+ggplot(sum_df, aes(x = condition, y = mean_time, fill = type)) +
+  geom_col(position = position_dodge(width = dodge_w), width = 0.7) +
+  geom_errorbar(
+    aes(ymin = mean_time - ci, ymax = mean_time + ci),
+    position = position_dodge(width = dodge_w),
+    width = 0.18,
+    linewidth = 0.6
+  ) +
+  # significance brackets per condition (prediction vs completion)
+  geom_segment(
+    data = sig_df,
+    aes(x = x1, xend = x2, y = y2, yend = y2),
+    inherit.aes = FALSE,
+    linewidth = 0.6
+  ) +
+  geom_segment(
+    data = sig_df,
+    aes(x = x1, xend = x1, y = y1, yend = y2),
+    inherit.aes = FALSE,
+    linewidth = 0.6
+  ) +
+  geom_segment(
+    data = sig_df,
+    aes(x = x2, xend = x2, y = y1, yend = y2),
+    inherit.aes = FALSE,
+    linewidth = 0.6
+  ) +
+  geom_text(
+    data = sig_df,
+    aes(x = (x1 + x2) / 2, y = y2, label = label),
+    inherit.aes = FALSE,
+    vjust = -0.4,
+    size = 4
+  ) +
+  scale_fill_discrete(name = NULL) +  # legend shows "Predicted time" / "Completion time"
+  labs(
+    x = NULL,
+    y = "Time",
+  ) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "top")
+
+dev.off()
+
+```
+
+
+
+
+## Figure 4a: forest plot for NASA-TLX difference per task, ordered by effect size (left)
+
+
+```{r}
+
+
+library(lme4)
+library(emmeans)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+completion_df <- completion_df %>%
+  mutate(
+    condition = factor(condition, levels = c("independent", "AI")),
+    taskID    = factor(taskID)
+  )
+
+# --- model ---
+m_task <- lmer(
+  NASA_TLX_average ~ condition * taskID + (1 | participantID),
+  data = completion_df
+)
+
+# --- emmeans contrast: independent - AI ---
+emm <- emmeans(m_task, ~ condition | taskID)
+ct  <- contrast(emm, method = list("independent - AI" = c(1, -1)), adjust = "none")
+
+# --- summary with CIs (robust across emmeans versions) ---
+ct_df <- as.data.frame(summary(ct, infer = c(TRUE, TRUE)))
+
+get_ci_cols <- function(df) {
+  if (all(c("lower.CL", "upper.CL") %in% names(df))) return(c("lower.CL", "upper.CL"))
+  if (all(c("asymp.LCL", "asymp.UCL") %in% names(df))) return(c("asymp.LCL", "asymp.UCL"))
+  if (all(c("LCL", "UCL") %in% names(df))) return(c("LCL", "UCL"))
+  NULL
+}
+
+ci_cols <- get_ci_cols(ct_df)
+
+if (is.null(ci_cols)) {
+  ct_df <- ct_df %>%
+    mutate(
+      lower = estimate - 1.96 * SE,
+      upper = estimate + 1.96 * SE
+    )
+} else {
+  ct_df <- ct_df %>%
+    mutate(
+      lower = .data[[ci_cols[1]]],
+      upper = .data[[ci_cols[2]]]
+    )
+}
+
+# --- determine significance: CI excludes 0 ---
+plot_df <- ct_df %>%
+  transmute(
+    taskID,
+    effect = estimate,          # independent − AI
+    lower,
+    upper,
+    significant = (lower > 0 | upper < 0)
+  ) %>%
+  arrange(effect) %>%
+  mutate(taskID = fct_inorder(taskID))
+
+# --- forest plot ---
+pdf("figure4a.pdf", width = 8, height = 6)
+ggplot(plot_df, aes(x = effect, y = taskID)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.6) +
+  geom_errorbarh(
+    aes(xmin = lower, xmax = upper),
+    height = 0.18,
+    linewidth = 0.6
+  ) +
+  geom_point(
+    aes(color = significant, shape = significant),
+    size = 2.6
+  ) +
+  scale_color_manual(
+    values = c("FALSE" = "grey50", "TRUE" = "black"),
+    labels = c("Not significant", "Significant")
+  ) +
+  scale_shape_manual(
+    values = c("FALSE" = 16, "TRUE" = 17),
+    labels = c("Not significant", "Significant")
+  ) +
+  labs(
+    x = "NASA-TLX difference (independent − AI)",
+    y = NULL,
+    color = NULL,
+    shape = NULL,
+    title = "Per-task NASA-TLX effect (independent − AI)"
+  ) +
+  theme_classic(base_size = 15) +
+  theme(legend.position = "top")
+dev.off()
+
+
+
+```
+
+
+
+## Figure 4b: forest plot for completion time difference, ordered by effect size (right)
+
+```{r}
+library(lme4)
+library(emmeans)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+completion_df <- completion_df %>%
+  mutate(
+    condition = factor(condition, levels = c("independent", "AI")),
+    taskID    = factor(taskID)
+  )
+
+# --- model ---
+m_task <- lmer(
+  time ~ condition * taskID + (1 | participantID),
+  data = completion_df
+)
+
+# --- emmeans contrast: independent - AI ---
+emm <- emmeans(m_task, ~ condition | taskID)
+ct  <- contrast(emm, method = list("independent - AI" = c(1, -1)), adjust = "none")
+
+# --- summary with CIs (robust across emmeans versions) ---
+ct_df <- as.data.frame(summary(ct, infer = c(TRUE, TRUE)))
+
+get_ci_cols <- function(df) {
+  if (all(c("lower.CL", "upper.CL") %in% names(df))) return(c("lower.CL", "upper.CL"))
+  if (all(c("asymp.LCL", "asymp.UCL") %in% names(df))) return(c("asymp.LCL", "asymp.UCL"))
+  if (all(c("LCL", "UCL") %in% names(df))) return(c("LCL", "UCL"))
+  NULL
+}
+
+ci_cols <- get_ci_cols(ct_df)
+
+if (is.null(ci_cols)) {
+  ct_df <- ct_df %>%
+    mutate(
+      lower = estimate - 1.96 * SE,
+      upper = estimate + 1.96 * SE
+    )
+} else {
+  ct_df <- ct_df %>%
+    mutate(
+      lower = .data[[ci_cols[1]]],
+      upper = .data[[ci_cols[2]]]
+    )
+}
+
+# --- determine significance: CI excludes 0 ---
+plot_df <- ct_df %>%
+  transmute(
+    taskID,
+    effect = estimate,          # independent − AI
+    lower,
+    upper,
+    significant = (lower > 0 | upper < 0)
+  ) %>%
+  arrange(effect) %>%
+  mutate(taskID = fct_inorder(taskID))
+
+# --- forest plot ---
+pdf("figure4b.pdf", width = 8, height = 6)
+ggplot(plot_df, aes(x = effect, y = taskID)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.6) +
+  geom_errorbarh(
+    aes(xmin = lower, xmax = upper),
+    height = 0.18,
+    linewidth = 0.6
+  ) +
+  geom_point(
+    aes(color = significant, shape = significant),
+    size = 2.6
+  ) +
+  scale_color_manual(
+    values = c("FALSE" = "grey50", "TRUE" = "black"),
+    labels = c("Not significant", "Significant")
+  ) +
+  scale_shape_manual(
+    values = c("FALSE" = 16, "TRUE" = 17),
+    labels = c("Not significant", "Significant")
+  ) +
+  labs(
+    x = "completion time difference (independent − AI)",
+    y = NULL,
+    color = NULL,
+    shape = NULL,
+    title = "Completion Time Difference (independent − AI), in seconds "
+  ) +
+  theme_classic(base_size = 15) +
+  theme(legend.position = "top")
+
+dev.off()
+
+```
+
+
+### additional plots
+# completion time across tasks
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+# summarize mean time and standard error for each taskID
+plot_df <- completion_df %>%
+  mutate(
+    CQ = str_extract(taskID, "^C\\dQ\\d"),
+    G  = str_extract(taskID, "G\\d$")
+  ) %>%
+  group_by(CQ, G, taskID) %>%
+  summarise(
+    mean_time = mean(time, na.rm = TRUE),
+    se_time   = sd(time, na.rm = TRUE) / sqrt(sum(!is.na(time))),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    CQ = factor(
+      CQ,
+      levels = unique(str_sort(CQ, numeric = TRUE))
+    ),
+    G = factor(G, levels = c("G1", "G2"))
+  )
+
+ggplot(plot_df, aes(x = CQ, y = mean_time, fill = G)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7
+  ) +
+  geom_errorbar(
+    aes(ymin = mean_time - se_time, ymax = mean_time + se_time),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  labs(
+    x = "Task family (same C and Q)",
+    y = "Average time",
+    fill = "Difficulty",
+    title = "Average time by task",
+    subtitle = "G1 and G2 shown side by side within each C-Q task"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+
+
+
+
+
+```{r}
+plot_df <- completion_df %>%
+  mutate(
+    CQ = str_extract(taskID, "^C\\dQ\\d"),
+    G  = str_extract(taskID, "G\\d$")
+  ) %>%
+  group_by(CQ, G, taskID) %>%
+  summarise(
+    mean_time = mean(NASA_TLX_average, na.rm = TRUE),
+    se_time   = sd(NASA_TLX_average, na.rm = TRUE) / sqrt(sum(!is.na(NASA_TLX_average))),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    CQ = factor(
+      CQ,
+      levels = unique(str_sort(CQ, numeric = TRUE))
+    ),
+    G = factor(G, levels = c("G1", "G2"))
+  )
+
+ggplot(plot_df, aes(x = CQ, y = mean_time, fill = G)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7
+  ) +
+  geom_errorbar(
+    aes(ymin = mean_time - se_time, ymax = mean_time + se_time),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  labs(
+    x = "Task family (same C and Q)",
+    y = "Average nasa-tlx",
+    fill = "Difficulty",
+    title = "Average nasa-tlx by task",
+    subtitle = "G1 and G2 shown side by side within each C-Q task"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+
+
+
+
+
