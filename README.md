@@ -7,6 +7,7 @@
 Presented at the 48th Annual Meeting of the Cognitive Science Society (2026; Brazil).
 
 [Link to experiment (prediction sample)](https://stanforduniversity.qualtrics.com/jfe/form/SV_bmfJCc51HLv9EJ8)
+
 [Link to experiment (completion sample)](https://stanforduniversity.qualtrics.com/jfe/form/SV_bkdLHgFHblApVn8)
 
 ```
