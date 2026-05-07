@@ -36,7 +36,8 @@ project_root/
 ├── data/
 │   ├── prediction_sample.csv
 │   ├── completion_sample1.csv
-│ study1_analysis_cogsci.Rmd
+├── analysis/
+|   ├── experiment.Rmd
 ├── figures/
 
 ```
@@ -44,7 +45,7 @@ project_root/
 - `/data`: raw data used (with demographic data removed -- please contact us directly if you are interested in using the full data)
   - `prediction_sample.csv`: the csv file for the prediction sample data (N=401).
   - `completion_sample1.csv`: the csv file for the completion sample data (N=836). The data includes annotations for the correctness of each response.
-- `study1_analysis_cogsci.Rmd`: analysis code used for the study, including preprocessing, main analysis, exploratory analysis, and plotting code.
+- `experiment.Rmd`: analysis code used for the study, including preprocessing, main analysis, exploratory analysis, and plotting code.
 
 ## Set up
 
